@@ -1,0 +1,134 @@
+---
+sync_devices:
+  hostname:
+    commands:
+      - command: "show system info"
+        parser: "textfsm"
+        jpath: "[*].hostname"
+  serial:
+    commands:
+      - command: "show system info"
+        parser: "textfsm"
+        jpath: "[*].serial"
+  device_type:
+    commands:
+      - command: "show system info"
+        parser: "textfsm"
+        jpath: "[*].model"
+  mgmt_interface:
+    commands:
+      - command: "show interface management"
+        parser: "textfsm"
+        jpath: "[*].name"
+  mask_length:
+    commands:
+      - command: "show interface management"
+        parser: "textfsm"
+        jpath: "[*].ipv4_netmask"
+        post_processor: "{{ obj[0] | netmask_to_cidr | int}}"
+        iterable_type: int
+sync_network_data:
+  pre_processor:
+    hardware_interfaces:
+      commands:
+        - command: "show interface hardware"
+          parser: "textfsm"
+          jpath: "[*].interface"  # when root_key=true this extracted value is what becomes interable in keys using __ under `current_key`.
+          post_processor: "{% set result={} %}{% for interface in obj %}{{ result.update({interface: {}}) or '' }}{% endfor %}{{ result | tojson }}"
+    logical_interfaces:
+      commands:
+        - command: "show interface logical"
+          parser: "textfsm"
+          jpath: "[*].interface" 
+          post_processor: "{% set result={} %}{% for interface in obj %}{{ result.update({interface: {}}) or '' }}{% endfor %}{{ result | tojson }}"
+    management_interface_ip:
+      commands:
+        - command: "show interface management"
+          parser: "textfsm"
+          jpath: "[*].ipv4_address" 
+          post_processor: "{{ obj[0] }}"
+    management_interface_prefix:
+      commands:
+        - command: "show interface management"
+          parser: "textfsm"
+          jpath: "[*].ipv4_netmask" 
+          post_processor: "{{ obj[0] | netmask_to_cidr }}"
+  serial:
+    commands:
+      - command: "show system info"
+        parser: "textfsm"
+        jpath: "[*].serial"
+  interfaces:
+    root_key: true
+    commands:
+      - command: "show interface management"
+        parser: "textfsm"
+        jpath: "[*].name"  # when root_key=true this extracted value is what becomes interable in keys using __ under `current_key`.
+        post_processor: "{% set result={} %}{% for name in obj %}{{ result.update({name: {}}) or '' }}{% endfor %}{{ result | merge_dicts(hardware_interfaces, logical_interfaces) | tojson }}"
+  interfaces__type:
+    commands:
+      - command: "show system state filter-pretty sw.dev.runtime.ifmon.port-states"
+        parser: "textfsm"
+        jpath: "[?interface=='{{ current_key }}'].type | [0] || ''"
+        post_processor: "{{ obj | map_palo_interface_type(current_key) }}"
+  interfaces__ip_addresses:
+    commands:
+      - command: "show interface logical"
+        parser: "textfsm"
+        jpath: "[?interface=='{{ current_key }}'].ip_address"
+        post_processor: |
+          {% set ip_with_prefix = obj[0] if obj and obj[0] != 'N/A' else None %}
+          {% if ip_with_prefix %}
+            {% set ip_address, prefix_length = ip_with_prefix.split('/') %}
+            {{ [{'ip_address': ip_address|string, 'prefix_length': prefix_length|string}] | tojson }}
+          {% elif current_key == 'Management Interface' %}
+            {{ [{'ip_address': management_interface_ip|string, 'prefix_length': management_interface_prefix|string}] | tojson }}
+          {% else %}
+            {{ [{'ip_address': '', 'prefix_length': ''}] | tojson }}
+          {% endif %}
+  interfaces__security_zone:
+    commands:
+      - command: "show interface logical"
+        parser: "textfsm"
+        jpath: "[?interface=='{{ current_key }}'].zone"
+        iterable_type: "str"
+  interfaces__lag:
+    commands:
+      - command: "show lacp aggregate-ethernet all"
+        parser: "textfsm"
+        jpath: "[?contains(@.member_interface, `{{ current_key | abbreviated_interface_name }}`)].ae_group"
+        post_processor: "{% if obj | length > 0 %}{{ obj[0] | canonical_interface_name }}{% else %}{{ obj }}{% endif %}"
+        iterable_type: "str"
+  interfaces__802.1Q_mode:
+    commands:
+      - command: "show interface logical"
+        parser: "textfsm"
+        jpath: "[?interface=='{{ current_key }}'].ip_address"
+        post_processor: "{{ 'access' }}"
+  interfaces__mtu:
+    commands:
+      - command: "show system state filter-pretty sw.dev.interface.config"
+        parser: "textfsm"
+        jpath: "[?interface=='{{ current_key }}'].mtu | [0] || '1500'"
+  interfaces__mac_address:
+    commands:
+      - command: "show interface hardware"
+        parser: "textfsm"
+        jpath: "[?interface=='{{ current_key }}'].mac_address"
+  interfaces__description:
+    commands:
+      - command: "show system state filter-pretty sw.dev.interface.config"
+        parser: "textfsm"
+        jpath: "[?interface=='{{ current_key }}'].comment | [0] || ' '"
+  interfaces__link_status:
+    commands:
+      - command: "show interface hardware"
+        parser: "textfsm"
+        jpath: "[?interface=='{{ current_key }}'].state | [0] || 'up'" #Assumes that the interface is up if it cannot be found in hardware, aka its a logical interface
+        post_processor: "{{ obj | interface_status_to_bool }}"
+  cables:
+    commands:
+      - command: "show lldp neighbors all"
+        parser: "textfsm"
+        jpath: "[*].{local_interface:local_interface, remote_interface:port_id, remote_device:system_name}"
+        post_processor: "{% set result = [] %}{% for cable in obj %}{% set _=result.append({'local_interface': cable['local_interface'], 'remote_interface': cable['remote_interface'], 'remote_device': cable['remote_device'] | remove_fqdn }) %}{% endfor %}{{ result | tojson }}"
